@@ -47,6 +47,8 @@ class DshProcess(
     private val startupSignal = CountDownLatch(1)
     @Volatile private var waiter: Thread? = null
     @Volatile private var stopper: Thread? = null
+    /** This launch was wrapped in `su`, so its tree runs as uid 0. */
+    @Volatile private var rootLaunched = false
     // Share captured identities across launcher replacement within this app
     // process. Both capture and cleanup use the shared state's monitor.
     private val cleanupState by lazy {
@@ -129,7 +131,12 @@ class DshProcess(
         val argv = ArrayList<String>()
         val sameBind = DirectLaunch.samePathBind(rootfs)
         val launchArgv = DirectLaunch.prootArguments(rootfs, manifest.launchArgv, direct)
-        val allBinds = binds.filterNot { expand(it) == sameBind }.distinct()
+        rootLaunched = false
+        val useRoot = !direct && !tawc && !safe && rootUsable()
+        if (useRoot) rootLaunched = true
+        // Root launch brings /data in: that is the point of it (other apps' data, adb, modules).
+        val allBinds = (binds + if (useRoot) listOf("/data:/data") else emptyList())
+            .filterNot { expand(it) == sameBind }.distinct()
         // PRoot's Node resolves through glibc, which fails A with a refused AAAA (#152): add Direct's resolver.
         val effectiveGuestEnv = guestEnv + ("DSH_GO_RUNTIME_ROOT" to rootfs.canonicalPath) +
             listOfNotNull(if (direct) null else "NODE_OPTIONS" to DirectLaunch.prootNodeOptions(guestEnv["NODE_OPTIONS"]))
@@ -205,6 +212,12 @@ class DshProcess(
             builder.command(tawcPlan.argv).directory(File(tawcPlan.cwd))
             env.clear()
             env.putAll(tawcPlan.environment)
+        }
+
+        if (useRoot) {
+            val quoted = builder.command().joinToString(" ") { "'" + it.replace("'", "'\\''") + "'" }
+            builder.command(listOf("su", "-c", quoted))
+            listener.onLog("[dsh-app] launch method: root via su", "system")
         }
 
         readyReported = false
@@ -351,6 +364,7 @@ class DshProcess(
             } finally {
                 try {
                     if (p.isAlive) p.destroyForcibly()
+                    killRootStrays()
                 } finally {
                     // Reap tracees before waiting: an OEM Process.waitFor may not
                     // return until they exit. The waiter still retains this owner.
@@ -455,7 +469,40 @@ class DshProcess(
     }
 
     /** Reap a captured process tree before releasing #17 ownership to another launch. */
-    @Synchronized fun killStrays(): Boolean = reapStrays().complete
+    @Synchronized fun killStrays(): Boolean {
+        killRootStrays()
+        return reapStrays().complete
+    }
+
+    /**
+     * A root launch is uid 0, so the app-uid /proc sweep below cannot see it. Sweep by the
+     * rootfs path in cmdline instead, through su.
+     */
+    private fun killRootStrays() {
+        if (!rootLaunched) return
+        val root = rootfs.canonicalPath
+        val script = "for d in /proc/[0-9]*; do c=\$(tr '\\0' ' ' < \$d/cmdline 2>/dev/null); " +
+            "case \"\$c\" in *" + root + "*) kill -9 \${d#/proc/} 2>/dev/null;; esac; done"
+        runCatching {
+            val sweep = ProcessBuilder("su", "-c", script).redirectErrorStream(true).start()
+            if (!sweep.waitFor(10, TimeUnit.SECONDS)) sweep.destroyForcibly()
+        }
+    }
+
+    /** True when `su` answers as uid 0 before the authorization grace period ends. */
+    private fun rootUsable(): Boolean = try {
+        val probe = ProcessBuilder("su", "-c", "id -u").redirectErrorStream(true).start()
+        val box = arrayOf("")
+        val reader = thread(isDaemon = true) {
+            box[0] = runCatching { probe.inputStream.bufferedReader().use { it.readText() } }.getOrDefault("")
+        }
+        val exited = probe.waitFor(15, TimeUnit.SECONDS)
+        if (!exited) probe.destroyForcibly()
+        reader.join(1000)
+        exited && box[0].trim().endsWith("0")
+    } catch (t: Throwable) {
+        false
+    }
 
     internal data class CleanupResult(val complete: Boolean, val ownedRemaining: Boolean, val canPruneTemp: Boolean = false)
 
